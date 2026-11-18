@@ -30,6 +30,7 @@ export class UI {
       overlay: $('overlay'),
       overlayMsg: $('overlay-msg'),
       toast: $('toast'),
+      sprintEdge: $('sprint-edge'),
       dmg: $('dmg'),
       fade: $('fade'),
       note: $('settings-note'),
@@ -118,6 +119,11 @@ export class UI {
 
   setStamina(v) {
     this.el.staminaBar.style.transform = `scaleX(${Math.max(0, Math.min(1, v / 100))})`;
+  }
+
+  setSprint(enabled, running) {
+    const state = !enabled ? 'off' : running ? 'running' : 'ready';
+    if (this.el.sprintEdge.dataset.state !== state) this.el.sprintEdge.dataset.state = state;
   }
 
   setEmf(level, on) {

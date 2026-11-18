@@ -33,6 +33,29 @@
       repeating-linear-gradient(0deg, rgba(255,255,255,0.012) 0 1px, rgba(0,0,0,0) 1px 3px);
     mix-blend-mode: multiply;
   }
+  #sprint-edge {
+    position: fixed; inset: 0; z-index: 10; pointer-events: none; overflow: hidden;
+    opacity: 0; transition: opacity 0.22s ease-out;
+    background: radial-gradient(ellipse at center, transparent 50%, rgba(23,34,34,0.25) 76%, rgba(9,14,15,0.62) 100%);
+    box-shadow: inset 0 0 clamp(30px, 8vmin, 90px) 14px rgba(13,22,23,0.76);
+  }
+  #sprint-edge[data-state="ready"] { opacity: 0.82; }
+  #sprint-edge[data-state="running"] { opacity: 1; }
+  #sprint-edge::before {
+    content: ""; position: absolute; inset: 0;
+    box-shadow: inset 0 0 clamp(40px, 9vmin, 130px) clamp(10px, 2vmin, 24px) rgba(123,151,147,0.62);
+  }
+  @media (prefers-reduced-motion: no-preference) {
+    #sprint-edge::before { animation: sprint-halo-breathe 1.4s ease-in-out infinite alternate paused; }
+    #sprint-edge:not([data-state="off"])::before { animation-play-state: running; }
+  }
+  @keyframes sprint-halo-breathe {
+    from { transform: scale(1); }
+    to { transform: scale(1.045); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    #sprint-edge { transition: none; }
+  }
   #fade { position: fixed; inset: 0; background: #000; pointer-events: none; z-index: 60; opacity: 1; transition: opacity 1.4s ease; }
   #fade.clear { opacity: 0; }
 
@@ -181,8 +204,9 @@
 <body>
   <div id="app"></div>
   <div id="vignette"></div>
+  <div id="sprint-edge" data-state="off" aria-hidden="true"></div>
   <div id="dmg"></div>
-  <div id="settings-note">G 画质 · F 手电 · E 躲藏 · SHIFT 冲刺 · 右键 探测</div>
+  <div id="settings-note">G 画质 · F 手电 · E 躲藏 · TAB 切换冲刺 · SHIFT 蹲下 / 站起 · SPACE 跳跃 · 右键 探测</div>
 
   <!-- 大厅 -->
   <div id="lobby" class="screen">
@@ -196,7 +220,9 @@
       <div class="hint" id="lobby-hint">两人输入同一个房间码即可同房。躲好之后确认，双方会交换地图。</div>
       <div class="keys">
         <kbd>WASD</kbd><span>移动</span>
-        <kbd>SHIFT</kbd><span>冲刺（消耗体力，会引来鬼）</span>
+        <kbd>TAB</kbd><span>开启 / 关闭冲刺（消耗体力，会引来鬼）</span>
+        <kbd>SHIFT</kbd><span>蹲下 / 站起</span>
+        <kbd>SPACE</kbd><span>跳跃</span>
         <kbd>E</kbd><span>躲进柜子 / 离开</span>
         <kbd>F</kbd><span>手电筒（暴露自己）</span>
         <kbd>右键</kbd><span>举起 EMF 探测器找人</span>

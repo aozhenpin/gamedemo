@@ -234,6 +234,28 @@ export function generateHospital(seed = 1234) {
   };
   ['ward', 'or', 'storage', 'bath', 'morgue', 'office'].forEach(ensureType);
 
+  // 房间之间还有未安装门扇的开口，摆放家具时同样要避让。
+  const passages = [];
+  for (let z = 1; z < D - 1; z++) for (let x = 1; x < W - 1; x++) {
+    if (!grid[idx(x, z)] || roomMask[idx(x, z)]) continue;
+    if ((grid[idx(x - 1, z)] && grid[idx(x + 1, z)] && (roomMask[idx(x - 1, z)] || roomMask[idx(x + 1, z)])) ||
+        (grid[idx(x, z - 1)] && grid[idx(x, z + 1)] && (roomMask[idx(x, z - 1)] || roomMask[idx(x, z + 1)]))) passages.push({ x, z });
+  }
+
+  // 封上与门框并排的缺口，原开口范围仍留给家具避让。
+  const doorTiles = new Set(doors.map(({ x, z }) => idx(x, z)));
+  for (const { x, z, side } of doors) {
+    const horizontal = side === 'n' || side === 's';
+    const tangent = horizontal ? 1 : W;
+    const normal = horizontal ? W : 1;
+    for (const offset of [-tangent, tangent]) {
+      const neighbor = idx(x, z) + offset;
+      if (!roomMask[neighbor] && !doorTiles.has(neighbor) && grid[neighbor - normal] && grid[neighbor + normal]) {
+        grid[neighbor] = 0;
+      }
+    }
+  }
+
   // ---------------------------------------------------------------- 材质
 
   const T = {
@@ -315,6 +337,7 @@ export function generateHospital(seed = 1234) {
       envMapIntensity: 1.0,
       transparent: true,
       opacity: 0.45,
+      depthWrite: false,
     }),
     carpet: new THREE.MeshStandardMaterial({
       map: T.fabric.map,
@@ -375,7 +398,10 @@ export function generateHospital(seed = 1234) {
   group.add(new THREE.HemisphereLight(0x2a3a44, 0x05070a, 0.64));
 
   const colliders = [];
+  const motionColliders = [];
   const hideSpots = [];
+  const lockerFootprint = [0.78, 0.64];
+  const wardrobeFootprint = [1.2, 0.72];
   const pillars = [];
   const furnitureBoxes = [];
   const lights = [];
@@ -390,6 +416,7 @@ export function generateHospital(seed = 1234) {
   };
 
   function addBox(mat, w, h, d, x, y, z, yaw = 0, uvPerMeter = 0.45) {
+    if (mat !== 'curtain' && mat !== 'water') addSolidBox(w, h, d, x, y, z, yaw);
     const g = scaleBoxUV(new THREE.BoxGeometry(w, h, d), w, h, d, uvPerMeter);
     if (yaw) g.applyMatrix4(new THREE.Matrix4().makeRotationY(yaw));
     g.translate(x, y, z);
@@ -397,17 +424,29 @@ export function generateHospital(seed = 1234) {
   }
 
   function addCyl(mat, rTop, rBot, h, x, y, z, seg = 10, yaw = 0) {
+    if (mat !== 'curtain' && mat !== 'water') addSolidBox(2 * Math.max(rTop, rBot), h, 2 * Math.max(rTop, rBot), x, y, z);
     const g = new THREE.CylinderGeometry(rTop, rBot, h, seg);
     if (yaw) g.applyMatrix4(new THREE.Matrix4().makeRotationY(yaw));
     g.translate(x, y, z);
     push(mat, g);
   }
 
+  // Navigation keeps conservative footprints; player physics uses the rendered parts and their heights.
+  function addSolidBox(w, h, d, x, y, z, yaw = 0) {
+    const cos = Math.cos(yaw), sin = Math.sin(yaw);
+    const hw = (Math.abs(cos) * w + Math.abs(sin) * d) / 2;
+    const hd = (Math.abs(sin) * w + Math.abs(cos) * d) / 2;
+    motionColliders.push({ cx: x, cz: z, halfW: w / 2, halfD: d / 2, cos, sin,
+      minX: x - hw, maxX: x + hw, minZ: z - hd, maxZ: z + hd,
+      minY: y - h / 2, maxY: y + h / 2 });
+  }
+
   function addCollider(cx, cz, w, d, yaw = 0) {
-    const horizontal = Math.abs(Math.sin(yaw)) > 0.7;
-    const ww = horizontal ? d : w;
-    const dd = horizontal ? w : d;
+    const cos = Math.cos(yaw), sin = Math.sin(yaw);
+    const ww = Math.abs(cos) * w + Math.abs(sin) * d;
+    const dd = Math.abs(sin) * w + Math.abs(cos) * d;
     const box = {
+      cx, cz, halfW: w / 2, halfD: d / 2, cos, sin,
       minX: cx - ww / 2,
       maxX: cx + ww / 2,
       minZ: cz - dd / 2,
@@ -464,22 +503,54 @@ export function generateHospital(seed = 1234) {
       const cx = x0 + TILE / 2;
       const cz = z0 + TILE / 2;
       const corridor = !roomMask[idx(x, z)];
+      // 内角由横向扶手占满，纵向扶手裁到其边缘，避免顶面重叠闪烁。
+      const trimN = isFloor(x, z - 1) ? 0 : 0.06;
+      const trimS = isFloor(x, z + 1) ? 0 : 0.06;
+      const railLength = TILE - trimN - trimS;
+      const railZ = cz + (trimN - trimS) / 2;
+      const rubberTrimN = trimN ? 0.055 : 0;
+      const rubberTrimS = trimS ? 0.055 : 0;
+      const rubberLength = TILE - rubberTrimN - rubberTrimS;
+      const rubberZ = cz + (rubberTrimN - rubberTrimS) / 2;
+      const skirtingN = trimN ? 0.045 : 0;
+      const skirtingS = trimS ? 0.045 : 0;
+      const skirtingLength = TILE - skirtingN - skirtingS;
+      const skirtingZ = cz + (skirtingN - skirtingS) / 2;
 
+      // 黑色垫条止于金属底面（y=0.97），端面不能与金属重叠。
       if (!isFloor(x, z - 1)) {
         addBox('dark', TILE, 0.13, 0.045, cx, 0.065, z0 + 0.0225, 0, 1.4);
-        if (corridor) addBox('rubber', TILE, 0.12, 0.05, cx, 0.98, z0 + 0.03, 0, 1.2);
+        if (corridor) addBox('rubber', TILE, 0.05, 0.05, cx, 0.945, z0 + 0.03, 0, 1.2);
+        if (corridor) addBox('metal', TILE, 0.1, 0.06, cx, 1.02, z0 + 0.03, 0, 1);
+        if (corridor) addCollider(cx, z0 + 0.03, TILE, 0.06);
       }
       if (!isFloor(x, z + 1)) {
         addBox('dark', TILE, 0.13, 0.045, cx, 0.065, z0 + TILE - 0.0225, 0, 1.4);
-        if (corridor) addBox('rubber', TILE, 0.12, 0.05, cx, 0.98, z0 + TILE - 0.03, 0, 1.2);
+        if (corridor) addBox('rubber', TILE, 0.05, 0.05, cx, 0.945, z0 + TILE - 0.03, 0, 1.2);
+        if (corridor) addBox('metal', TILE, 0.1, 0.06, cx, 1.02, z0 + TILE - 0.03, 0, 1);
+        if (corridor) addCollider(cx, z0 + TILE - 0.03, TILE, 0.06);
       }
       if (!isFloor(x - 1, z)) {
-        addBox('dark', 0.045, 0.13, TILE, x0 + 0.0225, 0.065, cz, 0, 1.4);
-        if (corridor) addBox('rubber', 0.05, 0.12, TILE, x0 + 0.03, 0.98, cz, 0, 1.2);
+        addBox('dark', 0.045, 0.13, skirtingLength, x0 + 0.0225, 0.065, skirtingZ, 0, 1.4);
+        if (corridor) addBox('rubber', 0.05, 0.05, rubberLength, x0 + 0.03, 0.945, rubberZ, 0, 1.2);
+        if (corridor) addBox('metal', 0.06, 0.1, railLength, x0 + 0.03, 1.02, railZ, 0, 1);
+        if (corridor) addCollider(x0 + 0.03, railZ, 0.06, railLength);
       }
       if (!isFloor(x + 1, z)) {
-        addBox('dark', 0.045, 0.13, TILE, x0 + TILE - 0.0225, 0.065, cz, 0, 1.4);
-        if (corridor) addBox('rubber', 0.05, 0.12, TILE, x0 + TILE - 0.03, 0.98, cz, 0, 1.2);
+        addBox('dark', 0.045, 0.13, skirtingLength, x0 + TILE - 0.0225, 0.065, skirtingZ, 0, 1.4);
+        if (corridor) addBox('rubber', 0.05, 0.05, rubberLength, x0 + TILE - 0.03, 0.945, rubberZ, 0, 1.2);
+        if (corridor) addBox('metal', 0.06, 0.1, railLength, x0 + TILE - 0.03, 1.02, railZ, 0, 1);
+        if (corridor) addCollider(x0 + TILE - 0.03, railZ, 0.06, railLength);
+      }
+      // 凸墙角的两段扶手之间补一个接头，门口不跨接。
+      if (corridor) for (const dx of [-1, 1]) for (const dz of [-1, 1]) {
+        if (isFloor(x + dx, z) && !roomMask[idx(x + dx, z)] &&
+            isFloor(x, z + dz) && !roomMask[idx(x, z + dz)] && !isFloor(x + dx, z + dz)) {
+          addBox('metal', 0.06, 0.1, 0.06,
+            x0 + (dx > 0 ? TILE - 0.03 : 0.03), 1.02,
+            z0 + (dz > 0 ? TILE - 0.03 : 0.03), 0, 1);
+          addCollider(x0 + (dx > 0 ? TILE - 0.03 : 0.03), z0 + (dz > 0 ? TILE - 0.03 : 0.03), 0.06, 0.06);
+        }
       }
     }
   }
@@ -548,11 +619,14 @@ export function generateHospital(seed = 1234) {
   };
 
   function doorLeaf(hx, hz, angle, width, height) {
+    addSolidBox(width, height, 0.05, hx + Math.cos(angle) * width / 2, height / 2 + 0.02, hz - Math.sin(angle) * width / 2, angle);
     const g = new THREE.BoxGeometry(width, height, 0.05);
     g.translate(width / 2, 0, 0);
     g.applyMatrix4(new THREE.Matrix4().makeRotationY(angle));
     g.translate(hx, height / 2 + 0.02, hz);
     push('wood', g);
+
+    addCollider(hx + Math.cos(angle) * width / 2, hz - Math.sin(angle) * width / 2, width, 0.05, angle);
 
     const h = new THREE.BoxGeometry(0.03, 0.16, 0.06);
     h.translate(width - 0.12, 0, 0.05);
@@ -568,9 +642,9 @@ export function generateHospital(seed = 1234) {
   }
 
   function doubleDoors(cx, cz, side) {
-    const dw = 0.92;
-    const dh = 2.08;
-    const off = TILE / 2 - 0.06;
+    const dw = 0.96;
+    const dh = 2.2;
+    const off = TILE / 2 - 0.13;
     if (side === 'n' || side === 's') {
       const dir = side === 'n' ? 1 : -1;
       doorLeaf(cx - off, cz, -dir * Math.PI * 0.38, dw, dh);
@@ -586,19 +660,24 @@ export function generateHospital(seed = 1234) {
     const cx = wx(door.x);
     const cz = wz(door.z);
     const horizontal = door.side === 'n' || door.side === 's';
+    const jambOffset = TILE / 2 - 0.07;
     // 门框
     if (horizontal) {
-      addBox('metal', 0.12, 2.35, 0.16, cx - TILE / 2 + 0.08, 1.175, cz, 0, 0.8);
-      addBox('metal', 0.12, 2.35, 0.16, cx + TILE / 2 - 0.08, 1.175, cz, 0, 0.8);
+      addBox('metal', 0.14, 2.23, 0.16, cx - jambOffset, 1.115, cz, 0, 0.8);
+      addBox('metal', 0.14, 2.23, 0.16, cx + jambOffset, 1.115, cz, 0, 0.8);
+      addCollider(cx - jambOffset, cz, 0.14, 0.16);
+      addCollider(cx + jambOffset, cz, 0.14, 0.16);
       addBox('metal', TILE, 0.14, 0.16, cx, 2.3, cz, 0, 0.8);
-      addBox('wall', TILE, WALL_H - 2.36, TILE, cx, (WALL_H + 2.36) / 2, cz, 0, 0.45);
+      addBox('wall', TILE, WALL_H - 2.37, TILE, cx, (WALL_H + 2.37) / 2, cz, 0, 0.45);
       // 门槛
       addBox('metal', TILE * 0.8, 0.02, 0.22, cx, 0.012, cz, 0, 1.2);
     } else {
-      addBox('metal', 0.16, 2.35, 0.12, cx, 1.175, cz - TILE / 2 + 0.08, 0, 0.8);
-      addBox('metal', 0.16, 2.35, 0.12, cx, 1.175, cz + TILE / 2 - 0.08, 0, 0.8);
+      addBox('metal', 0.16, 2.23, 0.14, cx, 1.115, cz - jambOffset, 0, 0.8);
+      addBox('metal', 0.16, 2.23, 0.14, cx, 1.115, cz + jambOffset, 0, 0.8);
+      addCollider(cx, cz - jambOffset, 0.16, 0.14);
+      addCollider(cx, cz + jambOffset, 0.16, 0.14);
       addBox('metal', 0.16, 0.14, TILE, cx, 2.3, cz, 0, 0.8);
-      addBox('wall', TILE, WALL_H - 2.36, TILE, cx, (WALL_H + 2.36) / 2, cz, 0, 0.45);
+      addBox('wall', TILE, WALL_H - 2.37, TILE, cx, (WALL_H + 2.37) / 2, cz, 0, 0.45);
       addBox('metal', 0.22, 0.02, TILE * 0.8, cx, 0.012, cz, 0, 1.2);
     }
 
@@ -642,8 +721,8 @@ export function generateHospital(seed = 1234) {
 
   // 出口标识
   for (const [px, pz, ry] of [
-    [1 * TILE + 0.04, wz(2.5), Math.PI / 2],
-    [37 * TILE - 0.04, wz(26.5), -Math.PI / 2],
+    [2 * TILE + 0.04, wz(2.5), Math.PI / 2],
+    [36 * TILE - 0.04, wz(26.5), -Math.PI / 2],
   ]) {
     const tex = exitSignTexture();
     const mat = new THREE.MeshStandardMaterial({
@@ -704,6 +783,10 @@ export function generateHospital(seed = 1234) {
       const px = x + lz * Math.sin(yaw);
       const pz = z + lz * Math.cos(yaw);
       addBox('metal', 1.0, 0.03, 0.03, px, 1.0, pz, yaw, 1);
+      for (const lx of [-0.4, 0.4]) {
+        const post = local(x, z, yaw, lx, lz);
+        addBox('metal', 0.024, 0.46, 0.024, post.x, 0.77, post.z, yaw, 1);
+      }
     }
     // 呼叫器
     const cb = local(x, z, yaw, -0.98, 0.3);
@@ -745,14 +828,14 @@ export function generateHospital(seed = 1234) {
     addBox('dark', 0.58, 1.8, 0.02, fx, 1.0, fz, yaw, 1);
     const hp = local(x, z, yaw, 0.2, 0.29);
     addBox('metal', 0.04, 0.16, 0.04, hp.x, 1.05, hp.z, yaw, 1);
-    addCollider(x, z, 0.78, 0.56, yaw);
+    addCollider(x, z, ...lockerFootprint, yaw);
     hideSpots.push({ x, z, yaw, type: 'locker' });
   }
 
   function shelf(x, z, yaw) {
     addBox('wood', 1.4, 1.8, 0.06, x, 0.9, z, yaw);
     for (let i = 0; i < 4; i++) {
-      addBox('wood', 1.4, 0.04, 0.42, x + Math.sin(yaw) * 0.18, 0.2 + i * 0.5, z + Math.cos(yaw) * 0.18, yaw);
+      addBox('wood', 1.4, 0.04, 0.36, x + Math.sin(yaw) * 0.21, 0.2 + i * 0.5, z + Math.cos(yaw) * 0.21, yaw);
     }
     addCollider(x, z, 1.45, 0.5, yaw);
   }
@@ -770,8 +853,8 @@ export function generateHospital(seed = 1234) {
   function chair(x, z, yaw) {
     addBox('metal', 0.45, 0.06, 0.45, x, 0.46, z, yaw);
     const bp = local(x, z, yaw, 0, -0.2);
-    addBox('dark', 0.45, 0.5, 0.05, bp.x, 0.7, bp.z, yaw);
-    addCyl('metal', 0.03, 0.03, 0.45, x, 0.23, z, 6);
+    addBox('dark', 0.45, 0.46, 0.05, bp.x, 0.72, bp.z, yaw);
+    addCyl('metal', 0.03, 0.03, 0.42, x, 0.245, z, 6);
     addCyl('dark', 0.22, 0.22, 0.03, x, 0.02, z, 10);
     addCollider(x, z, 0.5, 0.5, yaw);
   }
@@ -790,7 +873,12 @@ export function generateHospital(seed = 1234) {
     }
     // 侧栏
     for (const s of [-1, 1]) {
-      addBox('metal', 1.8, 0.03, 0.03, x, 0.72, z + s * 0.38, yaw, 1);
+      const rail = local(x, z, yaw, 0, s * 0.38);
+      addBox('metal', 1.8, 0.03, 0.03, rail.x, 0.72, rail.z, yaw, 1);
+      for (const lx of [-0.78, 0.78]) {
+        const post = local(x, z, yaw, lx, s * 0.35);
+        addBox('metal', 0.04, 0.16, 0.044, post.x, 0.8, post.z, yaw, 1);
+      }
     }
     addCollider(x, z, 2.0, 0.9, yaw);
   }
@@ -859,6 +947,21 @@ export function generateHospital(seed = 1234) {
     z: z - lx * Math.sin(yaw) + lz * Math.cos(yaw),
   });
 
+  function wallMount(x, z, yaw, width) {
+    const tx = Math.floor(x / TILE), tz = Math.floor(z / TILE);
+    const nx = Math.round(Math.sin(yaw)), nz = Math.round(Math.cos(yaw));
+    const mount = {
+      x: nx === 0 ? x : (tx + (nx < 0 ? 1 : 0)) * TILE,
+      z: nz === 0 ? z : (tz + (nz < 0 ? 1 : 0)) * TILE,
+    };
+    for (const offset of [-width / 2, 0, width / 2]) {
+      const edge = local(mount.x, mount.z, yaw, offset, 0.01);
+      const ex = Math.floor(edge.x / TILE), ez = Math.floor(edge.z / TILE);
+      if (!isFloor(ex, ez) || isFloor(ex - nx, ez - nz)) return null;
+    }
+    return mount;
+  }
+
   function atWall(room, side, t, offset = 0.55) {
     const c = roomCenter(room);
     const aw = Math.max(0.9, c.w - 1.2);
@@ -869,23 +972,44 @@ export function generateHospital(seed = 1234) {
     return { x: (room.x1 + 1) * TILE - offset, z: c.z + (t - 0.5) * ad, yaw: -Math.PI / 2 };
   }
 
-  function doorCenters(room) {
-    return room.doors.map((d) => ({ x: (d.x + 0.5) * TILE, z: (d.z + 0.5) * TILE }));
-  }
-
   function clearOfDoors(room, x, z, r = 1.35) {
-    return doorCenters(room).every((d) => Math.hypot(d.x - x, d.z - z) > r);
+    // 共用门洞也可能由相邻房间创建，必须检查全部门口并留出玩家宽度。
+    return passages.every((d) => Math.hypot(wx(d.x) - x, wz(d.z) - z) > Math.max(r, 1.75));
   }
 
   // 家具 AABB 是否压到门洞（门洞按 1 格宽）
-  function boxHitsDoor(room, minX, maxX, minZ, maxZ, margin = 0.15) {
-    return room.doors.some((d) => {
-      const dx0 = d.x * TILE - margin;
-      const dx1 = (d.x + 1) * TILE + margin;
-      const dz0 = d.z * TILE - margin;
-      const dz1 = (d.z + 1) * TILE + margin;
+  function boxHitsDoor(minX, maxX, minZ, maxZ) {
+    return passages.some((d) => {
+      const clearance = 0.34;
+      const dx0 = d.x * TILE - clearance;
+      const dx1 = (d.x + 1) * TILE + clearance;
+      const dz0 = d.z * TILE - clearance;
+      const dz1 = (d.z + 1) * TILE + clearance;
       return minX < dx1 && maxX > dx0 && minZ < dz1 && maxZ > dz0;
     });
+  }
+
+  function placeProp(build, ...args) {
+    const lengths = new Map([...buckets].map(([material, parts]) => [material, parts.length]));
+    const sceneData = [colliders, motionColliders, furnitureBoxes, hideSpots];
+    const starts = sceneData.map(items => items.length);
+    build(...args);
+
+    const blocksDoor = [...buckets].some(([material, parts]) => parts.slice(lengths.get(material) ?? 0).some(geometry => {
+      geometry.computeBoundingBox();
+      const { min, max } = geometry.boundingBox;
+      return min.y < 1.8 && max.y > 0.025 && boxHitsDoor(min.x, max.x, min.z, max.z);
+    }));
+    if (!blocksDoor && !motionColliders.slice(starts[1]).some(c =>
+      c.minY < 1.8 && c.maxY > 0.025 && boxHitsDoor(c.minX, c.maxX, c.minZ, c.maxZ)
+    )) return true;
+
+    // Keep the model, collisions and hiding spot together when rejecting a placement.
+    for (const [material, parts] of buckets) {
+      for (const geometry of parts.splice(lengths.get(material) ?? 0)) geometry.dispose();
+    }
+    sceneData.forEach((items, i) => { items.length = starts[i]; });
+    return false;
   }
 
   function sideSpots(room, side, count, offset, clearance = 1.35) {
@@ -916,6 +1040,17 @@ export function generateHospital(seed = 1234) {
   // 长边垂直于墙的朝向（床头/桌头贴墙）
   const intoRoomYaw = (f) => Math.atan2(-f.nz, f.nx);
 
+  function fitsFurniture(p, footprint) {
+    const swapped = Math.abs(Math.sin(p.yaw)) > 0.7;
+    const hw = (swapped ? footprint[1] : footprint[0]) / 2;
+    const hd = (swapped ? footprint[0] : footprint[1]) / 2;
+    const minX = p.x - hw, maxX = p.x + hw;
+    const minZ = p.z - hd, maxZ = p.z + hd;
+    return !boxHitsDoor(minX, maxX, minZ, maxZ) && !furnitureBoxes.some(
+      (b) => minX < b.maxX + 0.05 && maxX > b.minX - 0.05 && minZ < b.maxZ + 0.05 && maxZ > b.minZ - 0.05,
+    );
+  }
+
   // 沿墙尝试多个位置：同时避门洞和已有家具
   function tryPlace(
     room,
@@ -930,26 +1065,8 @@ export function generateHospital(seed = 1234) {
       if (Math.abs(t) > 0.45) continue;
       const f = wallFrame(room, side, 0.5 + t);
       const p = place(f, normal, 0);
-      if (footprint) {
-        const swapped = Math.abs(Math.sin(f.yaw)) > 0.7;
-        const hw = (swapped ? footprint[1] : footprint[0]) / 2;
-        const hd = (swapped ? footprint[0] : footprint[1]) / 2;
-        const minX = p.x - hw;
-        const maxX = p.x + hw;
-        const minZ = p.z - hd;
-        const maxZ = p.z + hd;
-        if (boxHitsDoor(room, minX, maxX, minZ, maxZ, 0.15)) continue;
-        if (
-          furnitureBoxes.some(
-            (b) => minX < b.maxX + 0.05 && maxX > b.minX - 0.05 && minZ < b.maxZ + 0.05 && maxZ > b.minZ - 0.05,
-          )
-        ) {
-          continue;
-        }
-      } else if (!clearOfDoors(room, p.x, p.z, clearance)) {
-        continue;
-      }
-      return { ...p, yaw: f.yaw, f };
+      if (footprint ? !fitsFurniture(p, footprint) : !clearOfDoors(room, p.x, p.z, clearance)) continue;
+      return { ...p, f };
     }
     return null;
   }
@@ -969,8 +1086,7 @@ export function generateHospital(seed = 1234) {
         ) {
           continue;
         }
-        bin(x, z);
-        return;
+        if (placeProp(bin, x, z)) return;
       }
     }
   }
@@ -1007,10 +1123,13 @@ export function generateHospital(seed = 1234) {
     g.applyMatrix4(new THREE.Matrix4().makeRotationY(Math.atan2(-dz, dx)));
     g.translate((x1 + x2) / 2, y, (z1 + z2) / 2);
     push('metal', g);
+    for (const t of [0.1, 0.9]) {
+      addCyl('metal', 0.012, 0.012, WALL_H - y, x1 + dx * t, (WALL_H + y) / 2, z1 + dz * t, 6);
+    }
   }
 
-  function addWheel(mat, r, x, y, z) {
-    const g = new THREE.CylinderGeometry(r, r, 0.035, 14);
+  function addWheel(mat, r, x, y, z, thickness = 0.035) {
+    const g = new THREE.CylinderGeometry(r, r, thickness, 14);
     g.rotateZ(Math.PI / 2);
     g.translate(x, y, z);
     push(mat, g);
@@ -1025,7 +1144,7 @@ export function generateHospital(seed = 1234) {
   // ---------------------------------------------------------------- 病房 / 手术 / 停尸 / 办公 / 储藏 / 盥洗
 
   function overbedTable(x, z, yaw) {
-    addCyl('metal', 0.03, 0.03, 0.86, x, 0.43, z, 6);
+    addCyl('metal', 0.03, 0.03, 0.88, x, 0.44, z, 6);
     addCyl('metal', 0.2, 0.22, 0.04, x, 0.02, z, 10);
     addBox('wood', 0.8, 0.05, 0.5, x, 0.9, z, yaw, 0.9);
     addCollider(x, z, 0.82, 0.52, yaw);
@@ -1049,7 +1168,8 @@ export function generateHospital(seed = 1234) {
       const h = local(x, z, yaw, s * 0.06, 0.34);
       addBox('metal', 0.025, 0.18, 0.025, h.x, 1.0, h.z, yaw, 1);
     }
-    addCollider(x, z, 1.2, 0.65, yaw);
+    addCollider(x, z, ...wardrobeFootprint, yaw);
+    hideSpots.push({ x, z, yaw, type: 'locker' });
   }
 
   function bin(x, z) {
@@ -1061,11 +1181,11 @@ export function generateHospital(seed = 1234) {
 
   function wheelchair(x, z, yaw) {
     addBox('fabric', 0.46, 0.05, 0.4, x, 0.46, z, yaw, 0.9);
-    addBox('dark', 0.46, 0.52, 0.05, x + Math.sin(yaw) * 0.2, 0.72, z + Math.cos(yaw) * 0.2, yaw);
+    addBox('dark', 0.46, 0.495, 0.05, x + Math.sin(yaw) * 0.2, 0.7325, z + Math.cos(yaw) * 0.2, yaw);
     for (const s of [-1, 1]) {
       const p = local(x, z, yaw, 0, s * 0.27);
       addWheel('rubber', 0.25, p.x, 0.27, p.z);
-      addWheel('metal', 0.19, p.x, 0.27, p.z);
+      addWheel('metal', 0.19, p.x, 0.27, p.z, 0.041);
       const q = local(x, z, yaw, 0.22, s * 0.24);
       addCyl('rubber', 0.055, 0.055, 0.03, q.x, 0.06, q.z, 10);
     }
@@ -1083,6 +1203,10 @@ export function generateHospital(seed = 1234) {
     for (const s of [-1, 1]) {
       const p = local(x, z, yaw, 0, s * 0.36);
       addBox('metal', 1.8, 0.03, 0.03, p.x, 1.02, p.z, yaw, 1);
+      for (const lx of [-0.78, 0.78]) {
+        const post = local(x, z, yaw, lx, s * 0.336);
+        addBox('metal', 0.04, 0.28, 0.04, post.x, 0.88, post.z, yaw, 1);
+      }
     }
     addCollider(x, z, 2.0, 0.78, yaw);
   }
@@ -1121,13 +1245,14 @@ export function generateHospital(seed = 1234) {
     addBox('paper', 0.34, 0.32, 0.3, x, 0.16, z, 0, 0.8);
     addCyl('metal', 0.15, 0.15, 0.02, x + 0.28, 0.02, z, 10);
     addCyl('wood', 0.016, 0.016, 1.1, x + 0.28, 0.57, z, 6);
+    addCollider(x + 0.28, z, 0.3, 0.3);
     addCollider(x, z, 0.42, 0.42, 0);
   }
 
   function oxygenCylinder(x, z) {
     addCyl('metal', 0.11, 0.11, 1.0, x, 0.5, z, 12);
     addCyl('dark', 0.06, 0.06, 0.12, x, 1.06, z, 8);
-    addCyl('metal', 0.02, 0.02, 0.16, x + 0.08, 1.05, z, 6);
+    addCyl('metal', 0.02, 0.02, 0.16, x + 0.065, 1.05, z, 6);
     addCollider(x, z, 0.3, 0.3, 0);
   }
 
@@ -1135,7 +1260,7 @@ export function generateHospital(seed = 1234) {
     addBox('dark', 0.72, 1.15, 0.55, x, 0.58, z, yaw, 0.7);
     addBox('metal', 0.76, 0.05, 0.58, x, 1.18, z, yaw, 0.9);
     const p = local(x, z, yaw, 0, 0.29);
-    addPlane('screen', 0.44, 0.26, p.x, 1.07, p.z, yaw);
+    addPlane('screen', 0.44, 0.26, p.x, 1.0, p.z, yaw);
     for (const s of [-1, 1]) {
       const q = local(x, z, yaw, s * 0.32, -0.1);
       addCyl('metal', 0.1, 0.1, 0.7, q.x, 0.35, q.z, 10);
@@ -1178,6 +1303,7 @@ export function generateHospital(seed = 1234) {
 
   function wallCabinet(x, z, yaw, w = 1.2, h = 0.7, y = 1.8) {
     addBox('wood', w, h, 0.38, x, y, z, yaw, 0.65);
+    addCollider(x, z, w, 0.44, yaw);
     for (const s of [-1, 1]) {
       const p = local(x, z, yaw, s * 0.28, 0.2);
       addBox('dark', 0.02, h - 0.08, 0.02, p.x, y, p.z, yaw, 1);
@@ -1188,6 +1314,7 @@ export function generateHospital(seed = 1234) {
 
   function xrayViewer(x, z, yaw) {
     addBox('dark', 0.72, 0.92, 0.06, x, 1.65, z, yaw, 0.9);
+    addCollider(x, z, 0.72, 0.08, yaw);
     const p = local(x, z, yaw, 0, 0.035);
     addPlane('paper', 0.6, 0.8, p.x, 1.65, p.z, yaw);
   }
@@ -1211,7 +1338,7 @@ export function generateHospital(seed = 1234) {
         addBox('metal', 0.16, 0.05, 0.06, h.x, 0.42 + r * 0.68, h.z, yaw, 1.2);
       }
     }
-    addCollider(x, z, 2.85, 0.65, yaw);
+    addCollider(x, z, 2.85, 0.74, yaw);
   }
 
   function stainlessTable(x, z, yaw) {
@@ -1232,7 +1359,13 @@ export function generateHospital(seed = 1234) {
   }
 
   function specimenShelf(x, z, yaw) {
-    addBox('wood', 1.3, 1.7, 0.4, x, 0.85, z, yaw, 0.6);
+    const back = local(x, z, yaw, 0, -0.185);
+    addBox('wood', 1.3, 1.64, 0.03, back.x, 0.85, back.z, yaw, 0.6);
+    for (const y of [0.015, 1.685]) addBox('wood', 1.3, 0.03, 0.4, x, y, z, yaw, 0.6);
+    for (const s of [-1, 1]) {
+      const side = local(x, z, yaw, s * 0.635, 0.015);
+      addBox('wood', 0.03, 1.64, 0.37, side.x, 0.85, side.z, yaw, 0.6);
+    }
     for (let i = 0; i < 3; i++) {
       const y = 0.35 + i * 0.48;
       const p = local(x, z, yaw, 0, 0.02);
@@ -1249,7 +1382,7 @@ export function generateHospital(seed = 1234) {
     addBox('paper', 0.36, 0.42, 0.5, x, 0.21, z, yaw, 0.9);
     addCyl('paper', 0.19, 0.2, 0.12, x, 0.46, z, 14);
     // 水箱朝墙（local -Z）
-    addBox('paper', 0.36, 0.55, 0.2, x - Math.sin(yaw) * 0.28, 0.5, z - Math.cos(yaw) * 0.28, yaw, 0.9);
+    addBox('paper', 0.36, 0.55, 0.13, x - Math.sin(yaw) * 0.315, 0.5, z - Math.cos(yaw) * 0.315, yaw, 0.9);
     addCollider(x, z, 0.42, 0.78, yaw);
   }
 
@@ -1269,18 +1402,20 @@ export function generateHospital(seed = 1234) {
     for (const s of [-1, 1]) {
       const p = local(x, z, yaw, s * 0.6, 0.2);
       addBox('dark', 0.04, 1.95, 1.15, p.x, 0.975, p.z, yaw, 0.9);
+      addCollider(p.x, p.z, 0.04, 1.15, yaw);
     }
-    addCollider(x, z, 1.25, 0.7, yaw);
   }
 
   function towelDispenser(x, z, yaw) {
     addBox('metal', 0.28, 0.24, 0.16, x, 1.5, z, yaw, 1);
+    addCollider(x, z, 0.28, 0.2, yaw);
     const p = local(x, z, yaw, 0, 0.09);
     addBox('paper', 0.2, 0.16, 0.02, p.x, 1.45, p.z, yaw, 1);
   }
 
   function handDryer(x, z, yaw) {
     addBox('metal', 0.24, 0.3, 0.16, x, 1.25, z, yaw, 0.9);
+    addCollider(x, z, 0.24, 0.2, yaw);
     const p = local(x, z, yaw, 0, 0.09);
     addBox('dark', 0.18, 0.05, 0.02, p.x, 1.2, p.z, yaw, 1);
   }
@@ -1296,14 +1431,20 @@ export function generateHospital(seed = 1234) {
   }
 
   function bookshelf(x, z, yaw) {
-    addBox('wood', 1.1, 1.9, 0.36, x, 0.95, z, yaw, 0.55);
+    const back = local(x, z, yaw, 0, -0.165);
+    addBox('wood', 1.1, 1.84, 0.03, back.x, 0.95, back.z, yaw, 0.55);
+    for (const y of [0.015, 1.885]) addBox('wood', 1.1, 0.03, 0.36, x, y, z, yaw, 0.55);
+    for (const s of [-1, 1]) {
+      const side = local(x, z, yaw, s * 0.535, 0.015);
+      addBox('wood', 0.03, 1.84, 0.33, side.x, 0.95, side.z, yaw, 0.55);
+    }
     for (let i = 0; i < 4; i++) {
       const y = 0.25 + i * 0.45;
       const p = local(x, z, yaw, 0, 0.02);
       addBox('wood', 1.04, 0.03, 0.32, p.x, y, p.z, yaw, 0.9);
       for (let j = 0; j < 7; j++) {
         const q = local(x, z, yaw, -0.42 + j * 0.13, 0.02);
-        const h = 0.24 + rng() * 0.1;
+        const h = Math.min(0.24 + rng() * 0.1, i === 3 ? 0.245 : 0.34);
         addBox(j % 3 === 0 ? 'red' : j % 3 === 1 ? 'fabric' : 'dark', 0.09, h, 0.2, q.x, y + h / 2 + 0.02, q.z, yaw, 1);
       }
     }
@@ -1313,7 +1454,7 @@ export function generateHospital(seed = 1234) {
   function sofa(x, z, yaw) {
     addBox('fabric', 1.9, 0.35, 0.8, x, 0.175, z, yaw, 0.7);
     const back = local(x, z, yaw, 0, -0.3);
-    addBox('fabric', 1.9, 0.5, 0.2, back.x, 0.6, back.z, yaw, 0.7);
+    addBox('fabric', 1.6, 0.5, 0.2, back.x, 0.6, back.z, yaw, 0.7);
     for (const s of [-1, 1]) {
       const p = local(x, z, yaw, s * 0.88, 0);
       addBox('fabric', 0.16, 0.45, 0.8, p.x, 0.575, p.z, yaw, 0.7);
@@ -1356,58 +1497,67 @@ export function generateHospital(seed = 1234) {
     addCyl('metal', 0.18, 0.2, 0.03, x, 0.02, z, 10);
     for (let i = 0; i < 3; i++) {
       const a = (i / 3) * Math.PI * 2;
-      addBox('metal', 0.22, 0.02, 0.02, x + Math.cos(a) * 0.1, 1.6, z + Math.sin(a) * 0.1, a, 1);
+      addBox('metal', 0.22, 0.02, 0.02, x + Math.cos(a) * 0.1, 1.6 + i * 0.025, z + Math.sin(a) * 0.1, a, 1);
     }
     addBox('fabric', 0.4, 0.5, 0.2, x + 0.1, 1.3, z, 0.3, 0.7);
+    addCollider(x, z, 0.4, 0.4, 0);
   }
 
   function bulletinBoard(x, z, yaw) {
     addBox('wood', 1.5, 0.95, 0.05, x, 1.6, z, yaw, 0.7);
+    addCollider(x, z, 1.5, 0.08, yaw);
+    const paperRng = mulberry32(seed ^ Math.round(x * 100) ^ (Math.round(z * 100) << 16));
     for (let i = 0; i < 7; i++) {
-      const p = local(x, z, yaw, (Math.random() - 0.5) * 1.2, 0.035);
-      addPlane('paper', 0.16 + Math.random() * 0.1, 0.2 + Math.random() * 0.1, p.x, 1.55 + (Math.random() - 0.5) * 0.6, p.z, yaw);
+      const p = local(x, z, yaw, (paperRng() - 0.5) * 1.2, 0.035 + i * 0.002);
+      addPlane('paper', 0.16 + paperRng() * 0.1, 0.2 + paperRng() * 0.1, p.x, 1.55 + (paperRng() - 0.5) * 0.6, p.z, yaw);
     }
   }
 
   function wallClock(x, z, yaw) {
+    addCollider(x, z, 0.34, 0.16, yaw);
     const p = local(x, z, yaw, 0, 0.02);
     addBox('dark', 0.34, 0.34, 0.04, p.x, 2.15, p.z, yaw, 1);
     const face = local(x, z, yaw, 0, 0.045);
     addBox('paper', 0.29, 0.29, 0.012, face.x, 2.15, face.z, yaw, 1);
     const hand1 = local(x, z, yaw, 0, 0.055);
     addBox('dark', 0.012, 0.11, 0.01, hand1.x, 2.19, hand1.z, yaw, 1);
-    const hand2 = local(x, z, yaw, 0.04, 0.055);
+    const hand2 = local(x, z, yaw, 0.04, 0.067);
     addBox('dark', 0.08, 0.012, 0.01, hand2.x, 2.15, hand2.z, yaw, 1);
   }
 
   function fireExtinguisher(x, z, yaw) {
-    const b = local(x, z, yaw, 0, 0.03);
+    const b = local(x, z, yaw, 0, 0.14);
     addCyl('red', 0.075, 0.075, 0.5, b.x, 1.0, b.z, 10);
-    addCyl('dark', 0.04, 0.04, 0.07, b.x, 1.29, b.z, 8);
-    const br = local(x, z, yaw, 0, 0.03);
-    addBox('dark', 0.04, 0.5, 0.04, br.x, 1.0, br.z, yaw, 1);
-    const h = local(x, z, yaw, 0.08, 0.03);
+    addCollider(b.x, b.z, 0.2, 0.2, yaw);
+    addCyl('dark', 0.04, 0.04, 0.07, b.x, 1.28, b.z, 8);
+    const br = local(x, z, yaw, 0, 0.047);
+    addBox('dark', 0.04, 0.18, 0.1, br.x, 1.0, br.z, yaw, 1);
+    const h = local(x, z, yaw, 0.065, 0.14);
     addBox('metal', 0.02, 0.16, 0.02, h.x, 1.2, h.z, 0, 1);
   }
 
   function sanitizer(x, z, yaw) {
     addBox('metal', 0.14, 0.24, 0.1, x, 1.3, z, yaw, 1);
+    addCollider(x, z, 0.14, 0.2, yaw);
     const p = local(x, z, yaw, 0, 0.06);
     addBox('paper', 0.1, 0.14, 0.08, p.x, 1.34, p.z, yaw, 1);
   }
 
   function gloveBox(x, z, yaw) {
     addBox('metal', 0.24, 0.16, 0.1, x, 1.4, z, yaw, 1);
+    addCollider(x, z, 0.24, 0.16, yaw);
     const p = local(x, z, yaw, 0, 0.06);
     addBox('paper', 0.18, 0.06, 0.04, p.x, 1.36, p.z, yaw, 1);
   }
 
   function lightSwitch(x, z, yaw) {
     addBox('paper', 0.08, 0.12, 0.02, x, 1.25, z, yaw, 1);
+    addCollider(x, z, 0.08, 0.02, yaw);
   }
 
   function gasPanel(x, z, yaw) {
     addBox('metal', 0.5, 0.34, 0.04, x, 1.5, z, yaw, 1);
+    addCollider(x, z, 0.5, 0.16, yaw);
     for (const s of [-1, 1]) {
       const p = local(x, z, yaw, s * 0.13, 0.04);
       addCyl('dark', 0.035, 0.035, 0.06, p.x, 1.5, p.z, 8);
@@ -1419,12 +1569,13 @@ export function generateHospital(seed = 1234) {
 
   function chartHolder(x, z, yaw) {
     addBox('dark', 0.24, 0.32, 0.03, x, 1.45, z, yaw, 1);
+    addCollider(x, z, 0.24, 0.06, yaw);
     const p = local(x, z, yaw, 0, 0.025);
     addPlane('paper', 0.2, 0.28, p.x, 1.45, p.z, yaw);
   }
 
   function ceilingVent(x, z) {
-    addBox('dark', 0.62, 0.04, 0.62, x, WALL_H - 0.03, z, 0, 0.9);
+    addBox('dark', 0.62, 0.05, 0.62, x, WALL_H - 0.025, z, 0, 0.9);
     for (let i = 0; i < 5; i++) {
       addBox('metal', 0.5, 0.015, 0.02, x, WALL_H - 0.05, z - 0.2 + i * 0.1, 0, 1);
     }
@@ -1447,12 +1598,16 @@ export function generateHospital(seed = 1234) {
 
   function debris(room, x, z) {
     const n = 2 + Math.floor(rng() * 4);
+    const placed = [];
     for (let i = 0; i < n; i++) {
       const s = 0.05 + rng() * 0.12;
       const bx = x + (rng() - 0.5) * 1.2;
       const bz = z + (rng() - 0.5) * 1.2;
       if (!clearOfDoors(room, bx, bz, 1.2)) continue;
-      addBox('dark', s, s * 0.6, s, bx, s * 0.3, bz, rng() * 3, 1.4);
+      const yaw = rng() * 3;
+      if (placed.some(p => Math.hypot(bx - p.x, bz - p.z) < (s + p.size) / Math.SQRT2 + 0.02)) continue;
+      placed.push({ x: bx, z: bz, size: s });
+      placeProp(addBox, 'dark', s, s * 0.6, s, bx, s * 0.3, bz, yaw, 1.4);
     }
   }
 
@@ -1460,14 +1615,14 @@ export function generateHospital(seed = 1234) {
 
   function decorateWalls(room) {
     const fns = [
-      (p) => gasPanel(p.x, p.z, p.yaw),
-      (p) => chartHolder(p.x, p.z, p.yaw),
-      (p) => sanitizer(p.x, p.z, p.yaw),
-      (p) => gloveBox(p.x, p.z, p.yaw),
-      (p) => lightSwitch(p.x, p.z, p.yaw),
-      (p) => wallClock(p.x, p.z, p.yaw),
-      (p) => fireExtinguisher(p.x, p.z, p.yaw),
-      (p) => bulletinBoard(p.x, p.z, p.yaw),
+      [gasPanel, 0.5, 0.02],
+      [chartHolder, 0.24, 0.015],
+      [sanitizer, 0.14, 0.05],
+      [gloveBox, 0.24, 0.05],
+      [lightSwitch, 0.08, 0.01],
+      [wallClock, 0.34, 0],
+      [fireExtinguisher, 0.2, 0],
+      [bulletinBoard, 1.5, 0.025],
     ];
     const sides = ['n', 's', 'e', 'w'];
     for (let i = 0; i < 5; i++) {
@@ -1481,7 +1636,12 @@ export function generateHospital(seed = 1234) {
       ) {
         continue;
       }
-      fns[Math.floor(rng() * fns.length)](p);
+      const [prop, width, offset] = fns[Math.floor(rng() * fns.length)];
+      const mount = wallMount(p.x, p.z, p.yaw, width);
+      if (!mount) continue;
+      const center = local(mount.x, mount.z, p.yaw, 0, offset);
+      if (prop === bulletinBoard && !fitsFurniture({ ...center, yaw: p.yaw }, [width, 0.08])) continue;
+      placeProp(prop, center.x, center.z, p.yaw);
     }
     const c = roomCenter(room);
     const vx = c.x + (rng() - 0.5) * 2.4;
@@ -1496,24 +1656,39 @@ export function generateHospital(seed = 1234) {
     const n = wallLen >= 8.6 ? 3 : 2;
     const beds = [];
     for (let i = 0; i < n; i++) {
-      const f = wallFrame(room, back, (i + 0.5) / n);
-      const p = place(f, 1.02, 0);
-      if (!clearOfDoors(room, p.x, p.z, 1.75)) continue;
-      beds.push({ f, p, yaw: intoRoomYaw(f) });
+      const frame = wallFrame(room, back, 0.5);
+      const along = ((i + 0.5) / n - 0.5) * wallLen;
+      for (const offset of [0, 0.35, -0.35, 0.7, -0.7]) {
+        const slot = along + offset;
+        if (Math.abs(slot) > wallLen / 2 - 0.6 || beds.some(b => Math.abs(b.slot - slot) < 2.18)) continue;
+        const f = { ...frame, ...place(frame, 0, slot) };
+        const p = place(f, 1.02, 0);
+        const yaw = intoRoomYaw(f);
+        if (!placeProp(bed, p.x, p.z, yaw)) continue;
+        beds.push({ f, p, slot });
+        break;
+      }
+    }
+    if (!beds.length) {
+      for (const side of [left, right, OPP[back]]) {
+        const p = tryPlace(room, side, 1.05, [0, 0.2, -0.2, 0.4, -0.4], 0, [1.0, 2.1]);
+        if (!p || !placeProp(bed, p.x, p.z, intoRoomYaw(p.f))) continue;
+        beds.push({ f: p.f, p });
+        break;
+      }
     }
 
     for (const b of beds) {
-      bed(b.p.x, b.p.z, b.yaw);
       // 床头柜 / 监护仪贴墙
       const ns = place(b.f, 0.26, 0.8);
-      if (clearOfDoors(room, ns.x, ns.z, 1.15)) nightstand(ns.x, ns.z, b.f.yaw);
+      if (clearOfDoors(room, ns.x, ns.z, 1.15)) placeProp(nightstand, ns.x, ns.z, b.f.yaw);
       const vm = place(b.f, 0.26, -0.8);
-      if (clearOfDoors(room, vm.x, vm.z, 1.15)) vitalMonitor(vm.x, vm.z, b.f.yaw);
+      if (clearOfDoors(room, vm.x, vm.z, 1.15)) placeProp(vitalMonitor, vm.x, vm.z, b.f.yaw);
       // 输液架 / 床上桌（放在床尾外侧，避免立柱穿过床架）
       const iv = place(b.f, 1.48, 1.02);
-      ivStand(iv.x, iv.z);
+      placeProp(ivStand, iv.x, iv.z);
       const ot = place(b.f, 2.28, 0.56);
-      overbedTable(ot.x, ot.z, ot.yaw);
+      placeProp(overbedTable, ot.x, ot.z, ot.yaw);
     }
 
     // 相邻病床之间的隔帘（从墙面向房间内）
@@ -1523,22 +1698,23 @@ export function generateHospital(seed = 1234) {
       const bx = mx - beds[i].f.nx * 1.02;
       const bz = mz - beds[i].f.nz * 1.02;
       if (!clearOfDoors(room, bx, bz, 1.2)) continue;
-      addTrack(bx, bz, bx + beds[i].f.nx * 1.9, bz + beds[i].f.nz * 1.9, WALL_H - 0.12);
       const cx = bx + beds[i].f.nx * 0.95;
       const cz = bz + beds[i].f.nz * 0.95;
       const yaw = intoRoomYaw(beds[i].f);
-      addPlane('curtain', 1.05, 2.9, cx, 1.83, cz, yaw);
-      hideSpots.push({ x: cx, z: cz, yaw, type: 'curtain' });
+      placeProp(() => {
+        addTrack(bx, bz, bx + beds[i].f.nx * 1.9, bz + beds[i].f.nz * 1.9, WALL_H - 0.12);
+        addPlane('curtain', 1.05, 2.9, cx, 1.83, cz, yaw);
+        hideSpots.push({ x: cx, z: cz, yaw, type: 'curtain' });
+      });
     }
 
-    const wf = wallFrame(room, left, 0.5);
-    const wp = place(wf, 0.36, 0);
-    if (clearOfDoors(room, wp.x, wp.z, 1.5)) wardrobe(wp.x, wp.z, wf.yaw);
+    const wp = tryPlace(room, left, 0.36, [0, 0.2, -0.2, 0.4, -0.4], 0, wardrobeFootprint)
+      ?? tryAnyWall(room, 0.36, wardrobeFootprint);
+    if (wp) placeProp(wardrobe, wp.x, wp.z, wp.yaw);
 
     for (const t of [0.32, 0.68]) {
-      const f = wallFrame(room, right, t);
-      const p = place(f, 0.48, 0);
-      if (clearOfDoors(room, p.x, p.z, 1.15)) chair(p.x, p.z, f.yaw);
+      const p = tryPlace(room, right, 0.48, [t - 0.5], 1.15, [0.5, 0.5]);
+      if (p) placeProp(chair, p.x, p.z, p.yaw);
     }
 
     placeBin(room, c);
@@ -1548,13 +1724,16 @@ export function generateHospital(seed = 1234) {
     if (c.w > 6 && c.d > 5.5) {
       const tx = c.x + (rng() - 0.5) * 1.4;
       const tz = c.z + (rng() - 0.5) * 1.4;
-      if (clearOfDoors(room, tx, tz, 2.1)) {
-        addCyl('wood', 0.45, 0.45, 0.05, tx, 0.72, tz, 16);
-        addCyl('metal', 0.04, 0.05, 0.7, tx, 0.36, tz, 8);
-        addCyl('dark', 0.3, 0.34, 0.04, tx, 0.02, tz, 16);
-        addCollider(tx, tz, 0.9, 0.9, 0);
-        chair(tx + 0.85, tz, -Math.PI / 2);
-        chair(tx - 0.85, tz, Math.PI / 2);
+      if (clearOfDoors(room, tx, tz, 2.1) && !furnitureBoxes.some(b =>
+        tx - 1.1 < b.maxX + 0.05 && tx + 1.1 > b.minX - 0.05 && tz - 0.45 < b.maxZ + 0.05 && tz + 0.45 > b.minZ - 0.05)) {
+        placeProp(() => {
+          addCyl('wood', 0.45, 0.45, 0.05, tx, 0.72, tz, 16);
+          addCyl('metal', 0.04, 0.05, 0.7, tx, 0.36, tz, 8);
+          addCyl('dark', 0.3, 0.34, 0.04, tx, 0.02, tz, 16);
+          addCollider(tx, tz, 0.9, 0.9, 0);
+        });
+        placeProp(chair, tx + 0.85, tz, -Math.PI / 2);
+        placeProp(chair, tx - 0.85, tz, Math.PI / 2);
       }
     }
 
@@ -1570,35 +1749,35 @@ export function generateHospital(seed = 1234) {
     const px = alongX ? 0 : 1;
     const pz = alongX ? 1 : 0;
 
-    operatingTable(c.x, c.z, yaw);
-    surgicalLamp(c.x, c.z);
+    if (placeProp(operatingTable, c.x, c.z, yaw)) surgicalLamp(c.x, c.z);
 
-    anesthesiaMachine(c.x + ax * 1.85, c.z + az * 1.85, yaw + Math.PI);
-    instrumentTable(c.x - ax * 1.7 + px * 0.7, c.z - az * 1.7 + pz * 0.7, yaw + Math.PI / 2);
-    mayoStand(c.x + ax * 0.55 + px * 1.25, c.z + az * 0.55 + pz * 1.25);
+    placeProp(anesthesiaMachine, c.x + ax * 1.85, c.z + az * 1.85, yaw + Math.PI);
+    placeProp(instrumentTable, c.x - ax * 1.7 + px * 0.7, c.z - az * 1.7 + pz * 0.7, yaw + Math.PI / 2);
+    placeProp(mayoStand, c.x + ax * 0.55 + px * 1.25, c.z + az * 0.55 + pz * 1.25);
 
     const bf = wallFrame(room, back, 0.28);
     const sp = place(bf, 0.29, 0);
-    if (clearOfDoors(room, sp.x, sp.z, 1.5)) scrubSink(sp.x, sp.z, bf.yaw);
+    if (clearOfDoors(room, sp.x, sp.z, 1.5)) placeProp(scrubSink, sp.x, sp.z, bf.yaw);
 
     const lf = wallFrame(room, left, 0.5);
-    const lc = place(lf, 0.2, 0);
-    if (clearOfDoors(room, lc.x, lc.z, 1.2)) wallCabinet(lc.x, lc.z, lf.yaw, 1.2, 0.65, 1.85);
+    const lc = place(lf, 0.19, 0);
+    if (clearOfDoors(room, lc.x, lc.z, 1.2)) placeProp(wallCabinet, lc.x, lc.z, lf.yaw, 1.2, 0.65, 1.85);
 
     const rf = wallFrame(room, right, 0.5);
-    const rv = place(rf, 0.05, 0);
-    if (clearOfDoors(room, rv.x, rv.z, 1.2)) xrayViewer(rv.x, rv.z, rf.yaw);
+    const rv = place(rf, 0.03, 0);
+    if (clearOfDoors(room, rv.x, rv.z, 1.2)) placeProp(xrayViewer, rv.x, rv.z, rf.yaw);
 
     const cf = wallFrame(room, back, 0.78);
     const cy = place(cf, 0.5, 0);
-    if (clearOfDoors(room, cy.x, cy.z, 1.2)) oxygenCylinder(cy.x, cy.z);
+    if (clearOfDoors(room, cy.x, cy.z, 1.2)) placeProp(oxygenCylinder, cy.x, cy.z);
     const sf = wallFrame(room, right, 0.22);
     const st = place(sf, 0.5, 0);
-    if (clearOfDoors(room, st.x, st.z, 1.0)) stool(st.x, st.z);
+    if (clearOfDoors(room, st.x, st.z, 1.0)) placeProp(stool, st.x, st.z);
 
     // 器械柜（手术室藏身点）
-    const lk = tryPlace(room, left, 0.35, [0.28, -0.28, 0.4], 1.2);
-    if (lk) locker(lk.x, lk.z, lk.yaw);
+    const lk = tryPlace(room, left, 0.35, [0.28, -0.28, 0.4], 0, lockerFootprint)
+      ?? tryAnyWall(room, 0.32, lockerFootprint);
+    if (lk) placeProp(locker, lk.x, lk.z, lk.yaw);
 
     placeBin(room, c);
     debris(room, c.x + 0.5, c.z - 1.6);
@@ -1611,16 +1790,17 @@ export function generateHospital(seed = 1234) {
     const bf = wallFrame(room, back, 0.5);
     for (const t of [-1.42, 0, 1.42]) {
       const p = place(bf, 0.18, t);
-      if (clearOfDoors(room, p.x, p.z, 1.2)) shelf(p.x, p.z, bf.yaw);
+      if (clearOfDoors(room, p.x, p.z, 1.2)) placeProp(shelf, p.x, p.z, bf.yaw);
     }
     const lf = wallFrame(room, left, 0.5);
     const lp = place(lf, 0.18, 0);
-    if (clearOfDoors(room, lp.x, lp.z, 1.3)) shelf(lp.x, lp.z, lf.yaw);
+    if (clearOfDoors(room, lp.x, lp.z, 1.3)) placeProp(shelf, lp.x, lp.z, lf.yaw);
 
     const rf = wallFrame(room, right, 0.5);
     for (const t of [-1.0, 0, 1.0]) {
       const p = place(rf, 0.32, t);
-      if (clearOfDoors(room, p.x, p.z, 1.1)) locker(p.x, p.z, rf.yaw);
+      const lk = fitsFurniture(p, lockerFootprint) ? p : tryAnyWall(room, 0.32, lockerFootprint);
+      if (lk) placeProp(locker, lk.x, lk.z, lk.yaw);
     }
 
     for (let i = 0; i < 7; i++) {
@@ -1628,14 +1808,18 @@ export function generateHospital(seed = 1234) {
       const z = c.z + (rng() - 0.5) * (c.d - 3.2);
       if (!clearOfDoors(room, x, z, 1.3)) continue;
       const s = 0.3 + rng() * 0.26;
-      addBox('wood', s, s * 0.8, s, x, s * 0.4, z, rng() * 3, 0.9);
-      if (rng() > 0.55) addBox('paper', s * 0.7, 0.02, s * 0.7, x, s * 0.81, z, rng() * 3, 1);
+      const yaw = rng() * 3;
+      placeProp(() => {
+        addBox('wood', s, s * 0.8, s, x, s * 0.4, z, yaw, 0.9);
+        addCollider(x, z, s, s, yaw);
+        if (rng() > 0.55) addBox('paper', s * 0.7, 0.02, s * 0.7, x, s * 0.81, z, rng() * 3, 1);
+      });
     }
 
     const cart = wallFrame(room, left, 0.82);
     const cp = place(cart, 0.55, 0);
-    if (clearOfDoors(room, cp.x, cp.z, 1.2)) cleaningCart(cp.x, cp.z, cart.yaw);
-    mopBucket(c.x - 1.5, c.z + 1.4);
+    if (clearOfDoors(room, cp.x, cp.z, 1.2)) placeProp(cleaningCart, cp.x, cp.z, cart.yaw);
+    placeProp(mopBucket, c.x - 1.5, c.z + 1.4);
     placeBin(room, c);
     decorateWalls(room);
   }
@@ -1647,10 +1831,8 @@ export function generateHospital(seed = 1234) {
     let df = tryPlace(room, back, 0.45, [0, 0.2, -0.2], 1.5, [1.7, 0.8]);
     if (!df) df = tryPlace(room, left, 0.45, [0, 0.2, -0.2], 1.5, [1.7, 0.8]);
     if (!df) df = tryPlace(room, right, 0.45, [0, 0.2, -0.2], 1.5, [1.7, 0.8]);
-    if (df) {
+    if (df && placeProp(() => {
       desk(df.x, df.z, df.yaw);
-      const ch = place(df.f, 1.12, 0);
-      chair(ch.x, ch.z, df.yaw + Math.PI);
       const mon = place(df.f, 0.32, 0.28);
       addBox('dark', 0.42, 0.3, 0.14, mon.x, 0.94, mon.z, df.yaw, 0.9);
       const scr = place(df.f, 0.32, 0.28);
@@ -1661,32 +1843,33 @@ export function generateHospital(seed = 1234) {
       addBox('dark', 0.32, 0.02, 0.12, kb.x, 0.8, kb.z, df.yaw, 1);
       const paper = place(df.f, 0.38, -0.55);
       addBox('paper', 0.22, 0.004, 0.3, paper.x, 0.792, paper.z, df.yaw, 1);
+    })) {
+      const ch = place(df.f, 1.12, 0);
+      placeProp(chair, ch.x, ch.z, df.yaw + Math.PI);
     }
 
     const fc = tryAnyWall(room, 0.32, [0.7, 0.6]);
-    if (fc) filingCabinet(fc.x, fc.z, fc.yaw);
+    if (fc) placeProp(filingCabinet, fc.x, fc.z, fc.yaw);
 
     const bs = tryAnyWall(room, 0.32, [1.2, 0.4]);
-    if (bs) bookshelf(bs.x, bs.z, bs.yaw);
+    if (bs) placeProp(bookshelf, bs.x, bs.z, bs.yaw);
 
     const frontSide = doorSideOf(room, back);
     const sofaP = tryAnyWall(room, 0.55, [2.0, 0.9], [frontSide, back, left, right]);
     if (sofaP) {
-      sofa(sofaP.x, sofaP.z, sofaP.yaw);
+      placeProp(sofa, sofaP.x, sofaP.z, sofaP.yaw);
       const ct = place(sofaP.f, 1.36, 0);
-      if (!boxHitsDoor(room, ct.x - 0.6, ct.x + 0.6, ct.z - 0.35, ct.z + 0.35, 0.15)) {
-        coffeeTable(ct.x, ct.z, sofaP.yaw);
-      }
+      placeProp(coffeeTable, ct.x, ct.z, sofaP.yaw);
     }
 
     const wcp = tryAnyWall(room, 0.3, [0.45, 0.45]);
-    if (wcp) waterCooler(wcp.x, wcp.z, wcp.yaw);
+    if (wcp) placeProp(waterCooler, wcp.x, wcp.z, wcp.yaw);
     const crp = tryAnyWall(room, 0.25, [0.45, 0.45]);
-    if (crp) coatRack(crp.x, crp.z, crp.yaw);
+    if (crp) placeProp(coatRack, crp.x, crp.z, crp.yaw);
 
     // 文件柜（值班室藏身点）
-    const lk = tryAnyWall(room, 0.32, [0.8, 0.6]);
-    if (lk) locker(lk.x, lk.z, lk.yaw);
+    const lk = tryAnyWall(room, 0.32, lockerFootprint);
+    if (lk) placeProp(locker, lk.x, lk.z, lk.yaw);
 
     placeBin(room, c);
     debris(room, c.x + 1.2, c.z + 1.2);
@@ -1697,29 +1880,31 @@ export function generateHospital(seed = 1234) {
     const c = roomCenter(room);
 
     const dpos = tryPlace(room, back, 0.34, [0], 0, [2.9, 0.7]);
-    if (dpos) morgueDrawers(dpos.x, dpos.z, dpos.yaw);
+    if (dpos) placeProp(morgueDrawers, dpos.x, dpos.z, dpos.yaw);
 
     const alongX = c.w >= c.d;
-    stainlessTable(c.x, c.z, alongX ? 0 : Math.PI / 2);
+    placeProp(stainlessTable, c.x, c.z, alongX ? 0 : Math.PI / 2);
 
     for (const [side, t] of [[left, 0.3], [right, 0.3]]) {
       const g = tryPlace(room, side, 1.05, [t - 0.5], 0, [2.0, 0.85]);
       if (!g) continue;
-      gurney(g.x, g.z, g.yaw);
-      bodyBag(g.x, g.z, g.yaw);
+      placeProp(() => {
+        gurney(g.x, g.z, g.yaw);
+        bodyBag(g.x, g.z, g.yaw);
+      });
     }
 
     const sc = tryPlace(room, back, 1.1, [0.4], 0, [0.3, 0.3]);
-    if (sc) hangingScale(sc.x, sc.z, sc.yaw);
+    if (sc) placeProp(hangingScale, sc.x, sc.z, sc.yaw);
 
     const sp = tryAnyWall(room, 0.22, [1.4, 0.45]);
-    if (sp) specimenShelf(sp.x, sp.z, sp.yaw);
+    if (sp) placeProp(specimenShelf, sp.x, sp.z, sp.yaw);
 
     const kp = tryAnyWall(room, 0.29, [0.9, 0.6]);
-    if (kp) sink(kp.x, kp.z, kp.yaw);
+    if (kp) placeProp(sink, kp.x, kp.z, kp.yaw);
 
-    const lp = tryAnyWall(room, 0.32, [0.8, 0.6]);
-    if (lp) locker(lp.x, lp.z, lp.yaw);
+    const lp = tryAnyWall(room, 0.32, lockerFootprint);
+    if (lp) placeProp(locker, lp.x, lp.z, lp.yaw);
 
     placeBin(room, c);
     debris(room, c.x - 1.2, c.z - 1.2);
@@ -1736,20 +1921,38 @@ export function generateHospital(seed = 1234) {
       const along = (i - n / 2) * 1.3;
       const p = place(bf, 0.65, along);
       if (!clearOfDoors(room, p.x, p.z, 1.35)) continue;
-      addBox('dark', 0.05, 1.95, 1.3, p.x, 0.975, p.z, bf.yaw, 0.9);
+      placeProp(() => {
+        addBox('dark', 0.05, 1.95, 1.3, p.x, 0.975, p.z, bf.yaw, 0.9);
+        addCollider(p.x, p.z, 0.05, 1.3, bf.yaw);
+      });
     }
     for (let i = 0; i < n; i++) {
       const along = (i - (n - 1) / 2) * 1.3;
       const p = place(bf, 0.72, along);
       if (!clearOfDoors(room, p.x, p.z, 1.35)) continue;
-      toilet(p.x, p.z, bf.yaw);
+      placeProp(toilet, p.x, p.z, bf.yaw);
     }
     // 贴墙无障碍扶手（两端带支耳）
-    const rail = place(bf, 0.06, 0);
-    addBox('metal', n * 1.3 + 0.4, 0.04, 0.04, rail.x, 1.0, rail.z, bf.yaw, 1);
-    for (const s of [-1, 1]) {
-      const b = place(bf, 0.03, (s * (n * 1.3 + 0.4)) / 2);
-      addBox('metal', 0.04, 0.04, 0.08, b.x, 1.0, b.z, bf.yaw, 1);
+    const halfRail = (n * 1.3 + 0.4) / 2;
+    let railSegments = [[-halfRail, halfRail]];
+    for (const door of passages.filter(d => back === 'n' ? d.z === room.z0 - 1 : back === 's' ? d.z === room.z1 + 1 : back === 'w' ? d.x === room.x0 - 1 : d.x === room.x1 + 1)) {
+      const t = (wx(door.x) - bf.x) * bf.tx + (wz(door.z) - bf.z) * bf.tz;
+      railSegments = railSegments.flatMap(([a, b]) => {
+        if (t + TILE / 2 <= a || t - TILE / 2 >= b) return [[a, b]];
+        return [[a, Math.max(a, t - TILE / 2)], [Math.min(b, t + TILE / 2), b]].filter(([lo, hi]) => hi > lo);
+      });
+    }
+    for (const [a, b] of railSegments) {
+      const rail = place(bf, 0.06, (a + b) / 2);
+      placeProp(() => {
+        addBox('metal', b - a, 0.04, 0.04, rail.x, 1.0, rail.z, bf.yaw, 1);
+        addCollider(rail.x, rail.z, b - a, 0.04, bf.yaw);
+        for (const t of [a + 0.02, b - 0.02]) {
+          const support = place(bf, 0, t);
+          addBox('metal', 0.04, 0.04, 0.08, support.x, 1.0, support.z, bf.yaw, 1);
+          addCollider(support.x, support.z, 0.04, 0.08, bf.yaw);
+        }
+      });
     }
 
     // 洗手台 + 镜子
@@ -1759,9 +1962,9 @@ export function generateHospital(seed = 1234) {
       const t = (i - (sinkCount - 1) / 2) * 1.3;
       const p = place(lf, 0.27, t);
       if (!clearOfDoors(room, p.x, p.z, 1.1)) continue;
-      sink(p.x, p.z, lf.yaw);
+      placeProp(sink, p.x, p.z, lf.yaw);
       const m = place(lf, 0.06, t);
-      addPlane('mirror', 0.62, 0.82, m.x, 1.68, m.z, lf.yaw);
+      placeProp(addPlane, 'mirror', 0.62, 0.82, m.x, 1.68, m.z, lf.yaw);
     }
 
     // 淋浴区（远离门口）
@@ -1770,19 +1973,20 @@ export function generateHospital(seed = 1234) {
     if (clearOfDoors(room, sc.x, sc.z, 1.35)) {
       const tx = rf.tx;
       const tz = rf.tz;
-      addTrack(sc.x - tx * 0.6, sc.z - tz * 0.6, sc.x + tx * 0.6, sc.z + tz * 0.6, 2.4);
       const curtainYaw = Math.atan2(-tz, tx);
-      addPlane('curtain', 1.15, 2.0, sc.x, 1.35, sc.z, curtainYaw);
-      hideSpots.push({ x: sc.x, z: sc.z, yaw: curtainYaw, type: 'curtain' });
-      addCyl('metal', 0.11, 0.09, 0.06, sc.x, 2.15, sc.z, 10);
-      addCyl('metal', 0.02, 0.02, 0.5, sc.x, 2.15, sc.z, 6);
-      // 淋浴托盘 + 地漏
-      addBox('dark', 0.95, 0.03, 0.95, sc.x, 0.015, sc.z, curtainYaw, 1);
-      addCyl('metal', 0.07, 0.07, 0.02, sc.x, 0.035, sc.z, 10);
+      placeProp(() => {
+        addTrack(sc.x - tx * 0.6, sc.z - tz * 0.6, sc.x + tx * 0.6, sc.z + tz * 0.6, 2.4);
+        addPlane('curtain', 1.15, 2.05, sc.x, 1.375, sc.z, curtainYaw);
+        hideSpots.push({ x: sc.x, z: sc.z, yaw: curtainYaw, type: 'curtain' });
+        addCyl('metal', 0.11, 0.09, 0.06, sc.x, 2.15, sc.z, 10);
+        addCyl('metal', 0.02, 0.02, WALL_H - 2.15, sc.x, (WALL_H + 2.15) / 2, sc.z, 6);
+        addBox('dark', 0.95, 0.03, 0.95, sc.x, 0.015, sc.z, curtainYaw, 1);
+        addCyl('metal', 0.07, 0.07, 0.02, sc.x, 0.035, sc.z, 10);
+      });
     }
 
-    const td = tryPlace(room, right, 0.085, [0.28, -0.28], 1.35);
-    if (td) towelDispenser(td.x, td.z, td.yaw);
+    const td = tryPlace(room, right, 0.08, [0.28, -0.28], 1.35);
+    if (td) placeProp(towelDispenser, td.x, td.z, td.yaw);
 
     placeBin(room, c);
     debris(room, c.x - 1.2, c.z - 1.2);
@@ -1813,19 +2017,39 @@ export function generateHospital(seed = 1234) {
   {
     const hx = ((HUB.x0 + HUB.x1) / 2 + 0.5) * TILE;
     const hz = ((HUB.z0 + HUB.z1) / 2 + 0.5) * TILE;
-    addBox('wood', 3.6, 1.05, 0.7, hx, 0.525, hz, 0, 0.5);
-    addBox('metal', 3.7, 0.05, 0.78, hx, 1.05, hz, 0, 0.8);
-    addCollider(hx, hz, 3.7, 0.8, 0);
-    addBox('dark', 0.5, 0.55, 0.05, hx - 1.4, 0.75, hz + 0.4);
-    chair(hx - 1.1, hz + 1.1, Math.PI);
-    chair(hx + 1.1, hz + 1.1, Math.PI);
+    placeProp(() => {
+      addBox('wood', 3.6, 1.05, 0.7, hx, 0.525, hz, 0, 0.5);
+      addBox('metal', 3.7, 0.05, 0.78, hx, 1.05, hz, 0, 0.8);
+      addCollider(hx, hz, 3.7, 0.8, 0);
+      addBox('dark', 0.5, 0.55, 0.05, hx - 1.4, 0.75, hz + 0.36);
+    });
+    placeProp(chair, hx - 1.1, hz + 1.1, Math.PI);
+    placeProp(chair, hx + 1.1, hz + 1.1, Math.PI);
     // 值班表 / 白板
-    const board = new THREE.Mesh(
-      new THREE.PlaneGeometry(2.2, 1.2),
-      new THREE.MeshStandardMaterial({ color: 0x3d433f, roughness: 0.95 }),
-    );
-    board.position.set(hx, 1.9, hz - 2.6);
-    group.add(board);
+    // Mount decorations only against actual walls in the generated layout.
+    const mounts = [];
+    for (let z = HUB.z0; z <= HUB.z1; z++) for (let x = HUB.x0; x <= HUB.x1; x++) {
+      if (!isFloor(x, z)) continue;
+      for (const [dx, dz] of [[0, -1], [0, 1], [-1, 0], [1, 0]]) {
+        if (isFloor(x + dx, z + dz)) continue;
+        mounts.push({ x: wx(x) + dx * (TILE / 2 - 0.025),
+          z: wz(z) + dz * (TILE / 2 - 0.025), yaw: Math.atan2(-dx, -dz) });
+      }
+    }
+    mounts.sort((a, b) => Math.hypot(a.x - hx, a.z - (hz - 2.6)) - Math.hypot(b.x - hx, b.z - (hz - 2.6)));
+    const mount = mounts[0];
+    if (mount) {
+      const board = new THREE.Mesh(
+        new THREE.BoxGeometry(2.2, 1.2, 0.04),
+        new THREE.MeshStandardMaterial({ color: 0x3d433f, roughness: 0.95 }),
+      );
+      board.name = 'nurse-station-board';
+      board.position.set(mount.x, 1.9, mount.z);
+      board.rotation.y = mount.yaw;
+      group.add(board);
+      addSolidBox(2.2, 1.2, 0.04, mount.x, 1.9, mount.z, mount.yaw);
+      addCollider(mount.x, mount.z, 2.2, 0.04, mount.yaw);
+    }
     const hubLight = new THREE.PointLight(ZONE_LIGHT.hub, 14, 11, 2);
     hubLight.position.set(hx, WALL_H - 0.3, hz);
     group.add(hubLight);
@@ -1838,9 +2062,13 @@ export function generateHospital(seed = 1234) {
       emissiveIntensity: 0.2,
       roughness: 0.6,
     });
-    const hubSign = new THREE.Mesh(new THREE.PlaneGeometry(1.8, 0.6), hubMat);
-    hubSign.position.set(hx, 2.55, hz - 2.75);
-    group.add(hubSign);
+    if (mount) {
+      const hubSign = new THREE.Mesh(new THREE.PlaneGeometry(1.8, 0.6), hubMat);
+      hubSign.name = 'nurse-station-sign';
+      hubSign.position.set(mount.x, 2.85, mount.z);
+      hubSign.rotation.y = mount.yaw;
+      group.add(hubSign);
+    }
   }
 
   // 走廊陈设：贴墙、平行于墙面摆放
@@ -1866,10 +2094,10 @@ export function generateHospital(seed = 1234) {
       g.applyMatrix4(new THREE.Matrix4().makeRotationY(yaw + tilt));
       g.translate(x, 0, z);
       push('curtain', g);
+      addSolidBox(0.64, 2.0, 0.04, x + Math.cos(yaw + tilt) * ox, 1.0, z - Math.sin(yaw + tilt) * ox, yaw + tilt);
+      addCollider(x + Math.cos(yaw + tilt) * ox, z - Math.sin(yaw + tilt) * ox, 0.64, 0.04, yaw + tilt);
     }
     hideSpots.push({ x, z, yaw, type: 'screen' });
-    addCollider(x, z, 1.9, 0.2, yaw);
-    placedCorridor.push({ x, z });
   }
 
   for (const [x, z, yaw] of [
@@ -1878,7 +2106,7 @@ export function generateHospital(seed = 1234) {
     [4.72, wz(12.5), Math.PI / 2],
     [78.88, wz(18.5), -Math.PI / 2],
   ]) {
-    privacyScreen(x, z, yaw);
+    if (placeProp(privacyScreen, x, z, yaw)) placedCorridor.push({ x, z });
   }
 
   const corridorWalls = [
@@ -1915,7 +2143,8 @@ export function generateHospital(seed = 1234) {
         const x = wall.axis === 'x' ? along : wall.fixed;
         const z = wall.axis === 'x' ? wall.fixed : along;
         if (!corridorFree(x, z, 1.6)) continue;
-        corridorKinds[Math.floor(rng() * corridorKinds.length)](x, z, wall.yaw);
+        const prop = corridorKinds[Math.floor(rng() * corridorKinds.length)];
+        if (!placeProp(prop, x, z, wall.yaw)) continue;
         placedCorridor.push({ x, z });
         break;
       }
@@ -1933,9 +2162,13 @@ export function generateHospital(seed = 1234) {
     [78.92, wz(23), -Math.PI / 2],
   ]) {
     const pick = Math.floor(rng() * 3);
-    if (pick === 0) bulletinBoard(x, z, yaw);
-    else if (pick === 1) wallClock(x, z, yaw);
-    else fireExtinguisher(x, z, yaw);
+    const mount = wallMount(x, z, yaw, [1.5, 0.34, 0.2][pick]);
+    if (!mount) continue;
+    if (pick === 0) {
+      const p = local(mount.x, mount.z, yaw, 0, 0.025);
+      placeProp(bulletinBoard, p.x, p.z, yaw);
+    } else if (pick === 1) placeProp(wallClock, mount.x, mount.z, yaw);
+    else placeProp(fireExtinguisher, mount.x, mount.z, yaw);
   }
 
   // 走廊里的折叠屏风（只保留这一份实现）
@@ -1945,7 +2178,7 @@ export function generateHospital(seed = 1234) {
     [4.95, wz(12.5), Math.PI / 2],
     [78.95, wz(18.5), -Math.PI / 2],
   ]) {
-    privacyScreen(x, z, yaw);
+    if (placeProp(privacyScreen, x, z, yaw)) placedCorridor.push({ x, z });
   }
 
   // ---------------------------------------------------------------- 灯光
@@ -1962,7 +2195,7 @@ export function generateHospital(seed = 1234) {
     const fixtureGeo = new THREE.BoxGeometry(1.2, 0.06, 0.22);
     const fixtureMat = MAT.lamp.clone();
     const fixture = new THREE.Mesh(fixtureGeo, fixtureMat);
-    fixture.position.set(x, WALL_H - 0.12, z);
+    fixture.position.set(x, WALL_H - 0.03, z);
     group.add(fixture);
     const light = new THREE.PointLight(ZONE_LIGHT.corridor, 14, 12, 2);
     light.position.set(x, WALL_H - 0.4, z);
@@ -1984,7 +2217,7 @@ export function generateHospital(seed = 1234) {
         roughness: 0.6,
       }),
     );
-    panel.position.set(x, WALL_H - 0.1, z);
+    panel.position.set(x, WALL_H - 0.0225, z);
     group.add(panel);
 
     if (i % 2 !== 0) return;
@@ -1992,7 +2225,7 @@ export function generateHospital(seed = 1234) {
     const fixtureMat = MAT.lamp.clone();
     fixtureMat.emissiveIntensity = 1.6;
     const fixture = new THREE.Mesh(fixtureGeo, fixtureMat);
-    fixture.position.set(x, WALL_H - 0.14, z);
+    fixture.position.set(x, WALL_H - 0.025, z);
     group.add(fixture);
     const light = new THREE.PointLight(ZONE_LIGHT[room.zone] || 0xbfd9e6, 11, 9, 2);
     light.position.set(x, WALL_H - 0.5, z);
@@ -2022,6 +2255,7 @@ export function generateHospital(seed = 1234) {
     pillars.push([wx(tx), 31.15], [wx(tx), 34.85]);
   }
   for (const [px, pz] of pillars) {
+    if (boxHitsDoor(px - 0.26, px + 0.26, pz - 0.26, pz + 0.26)) continue;
     addBox('wall', 0.46, WALL_H, 0.46, px, WALL_H / 2, pz, 0, 0.45);
     addBox('metal', 0.52, 0.12, 0.52, px, 0.06, pz, 0, 0.9);
     addCollider(px, pz, 0.52, 0.52, 0);
@@ -2037,24 +2271,15 @@ export function generateHospital(seed = 1234) {
     addBox('dark', TILE * 2, 0.34, 0.3, wx(34.5), WALL_H - 0.17, wz(tz), 0, 1);
   }
 
-  // 扶手
-  const railY = 1.02;
-  addBox('metal', 33 * TILE, 0.1, 0.06, 17.5 * TILE, railY, 4.5, 0, 1);
-  addBox('metal', 33 * TILE, 0.1, 0.06, 17.5 * TILE, railY, 8.7, 0, 1);
-  addBox('metal', 33 * TILE, 0.1, 0.06, 17.5 * TILE, railY, 57.3, 0, 1);
-  addBox('metal', 33 * TILE, 0.1, 0.06, 17.5 * TILE, railY, 61.5, 0, 1);
-  addBox('metal', 0.06, 0.1, 23 * TILE, 4.5, railY, 15 * TILE, 0, 1);
-  addBox('metal', 0.06, 0.1, 23 * TILE, 8.7, railY, 15 * TILE, 0, 1);
-  addBox('metal', 0.06, 0.1, 23 * TILE, 75.1, railY, 15 * TILE, 0, 1);
-  addBox('metal', 0.06, 0.1, 23 * TILE, 78.9, railY, 15 * TILE, 0, 1);
-
   // ---------------------------------------------------------------- 管线
 
   function addPipe(mat, radius, length, x, y, z, alongX = true, seg = 10) {
+    addSolidBox(alongX ? length : radius * 2, alongX ? radius * 2 : length, radius * 2, x, y, z);
     const g = new THREE.CylinderGeometry(radius, radius, length, seg);
     if (alongX) g.rotateZ(Math.PI / 2);
     g.translate(x, y, z);
     push(mat, g);
+    if (!alongX) addCollider(x, z, radius * 2, radius * 2);
   }
 
   const corridorLen = 33 * TILE;
@@ -2075,7 +2300,7 @@ export function generateHospital(seed = 1234) {
     [18.4 * TILE, 7 * TILE, false],
     [18.4 * TILE, 22 * TILE, false],
   ]) {
-    addPipe('metal', 0.04, WALL_H - 0.3, x, (WALL_H - 0.3) / 2, z, alongX, 8);
+    placeProp(addPipe, 'metal', 0.04, WALL_H - 0.3, x, (WALL_H - 0.3) / 2, z, alongX, 8);
   }
 
   // ---------------------------------------------------------------- 窗户（外环）
@@ -2088,11 +2313,11 @@ export function generateHospital(seed = 1234) {
     const ox = Math.sin(ry) * 0.04;
     const oz = Math.cos(ry) * 0.04;
     for (const [ww, hh, ax, ay] of [
-      [w + 0.12, 0.07, 0, h / 2 + 0.03],
-      [w + 0.12, 0.07, 0, -h / 2 - 0.03],
-      [0.07, h + 0.06, -w / 2 - 0.03, 0],
-      [0.07, h + 0.06, w / 2 + 0.03, 0],
-      [0.05, h, 0, 0],
+      [w + 0.13, 0.07, 0, h / 2 + 0.03],
+      [w + 0.13, 0.07, 0, -h / 2 - 0.03],
+      [0.07, h - 0.01, -w / 2 - 0.03, 0],
+      [0.07, h - 0.01, w / 2 + 0.03, 0],
+      [0.05, h - 0.01, 0, 0],
     ]) {
       const g = new THREE.BoxGeometry(ww, hh, 0.05);
       if (ry) g.applyMatrix4(new THREE.Matrix4().makeRotationY(ry));
@@ -2122,17 +2347,19 @@ export function generateHospital(seed = 1234) {
     m.scale.set(s, s, s);
     m.position.set(x, 0.012, z);
     m.rotation.y = rng() * Math.PI * 2;
+    m.renderOrder = 10 + i;
     group.add(m);
   }
 
   const puddleGeo = new THREE.CircleGeometry(1, 16);
   puddleGeo.rotateX(-Math.PI / 2);
-  for (let i = 0; i < 16; i++) {
+  for (let i = 0; i < 16 && placedCorridor.length; i++) {
     const spot = placedCorridor[i % placedCorridor.length];
     const m = new THREE.Mesh(puddleGeo, MAT.puddle);
     const s = 0.4 + rng() * 1.1;
     m.scale.set(s, 1, s * 0.8);
     m.position.set(spot.x + (rng() - 0.5) * 1.4, 0.008, spot.z + (rng() - 0.5) * 1.4);
+    m.renderOrder = 30 + i;
     group.add(m);
   }
 
@@ -2282,10 +2509,30 @@ export function generateHospital(seed = 1234) {
     centerOf(34, 26),
   ];
 
+  const collisionGrid = Array.from({ length: W * D }, () => []);
+  for (const c of motionColliders) {
+    for (let z = Math.max(0, Math.floor(c.minZ / TILE)); z <= Math.min(D - 1, Math.floor(c.maxZ / TILE)); z++) {
+      for (let x = Math.max(0, Math.floor(c.minX / TILE)); x <= Math.min(W - 1, Math.floor(c.maxX / TILE)); x++) collisionGrid[z * W + x].push(c);
+    }
+  }
+
+  function nearbyColliders(x, z, radius) {
+    const found = new Set();
+    for (let iz = Math.max(0, Math.floor((z - radius) / TILE)); iz <= Math.min(D - 1, Math.floor((z + radius) / TILE)); iz++) {
+      for (let ix = Math.max(0, Math.floor((x - radius) / TILE)); ix <= Math.min(W - 1, Math.floor((x + radius) / TILE)); ix++) {
+        for (const c of collisionGrid[iz * W + ix]) found.add(c);
+      }
+    }
+    return [...found];
+  }
+
   return {
     seed,
     group,
     colliders,
+    motionColliders,
+    nearbyColliders,
+    ceilingHeight: WALL_H,
     hideSpots,
     lights,
     rooms,

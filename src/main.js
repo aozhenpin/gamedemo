@@ -186,12 +186,16 @@ class Game {
     this.ui.setTimer(null);
     this.ui.setHideConfirm(true);
     this.ui.setEmf(0, false);
-    this.ui.setNote(`G 画质(${QUALITIES[this.qualityIndex]}) · F 手电 · E 躲藏 · SHIFT 冲刺 · 右键 探测 · R 就位`);
+    this.ui.setNote(`G 画质(${QUALITIES[this.qualityIndex]}) · F 手电 · E 躲藏 · TAB 切换冲刺 · SHIFT 蹲下 / 站起 · SPACE 跳跃 · 右键 探测 · R 就位`);
     this.input.requestLock();
   }
 
   confirmHide() {
     if (this.mode !== 'hide') return;
+    if (!this.player.grounded && !this.player.hiding) {
+      this.ui.toast('落地站稳后再按 R 就位');
+      return;
+    }
 
     // 不允许贴入口躲藏，否则对方一进来就会撞上
     const sp = this.world.spawns;
@@ -208,6 +212,7 @@ class Game {
       this.player.position.z,
       this.player.yaw,
       this.player.hiding ? this.world.hideSpots.indexOf(this.player.hiding) : -1,
+      this.player.position.y,
     );
     this.mode = 'hideWait';
     this.ui.setHideConfirm(false);
@@ -438,6 +443,9 @@ class Game {
       this.update(dt);
     }
 
+    const canMove = this.mode === 'hide' || this.mode === 'play';
+    this.ui.setSprint(canMove && this.player?.sprintEnabled, canMove && this.player?.sprinting);
+
     if (this.dust) this.dust.update(dt, this.app.camera);
     this.app.render(dt);
     this.input.endFrame();
@@ -450,7 +458,7 @@ class Game {
     if (input.pressed('KeyG')) {
       this.qualityIndex = (this.qualityIndex + 1) % QUALITIES.length;
       this.app.setQuality(QUALITIES[this.qualityIndex]);
-      this.ui.setNote(`G 画质(${QUALITIES[this.qualityIndex]}) · F 手电 · E 躲藏 · SHIFT 冲刺 · 右键 探测 · R 就位`);
+      this.ui.setNote(`G 画质(${QUALITIES[this.qualityIndex]}) · F 手电 · E 躲藏 · TAB 切换冲刺 · SHIFT 蹲下 / 站起 · SPACE 跳跃 · 右键 探测 · R 就位`);
       this.ui.toast(`画质：${QUALITIES[this.qualityIndex]}`);
     }
 

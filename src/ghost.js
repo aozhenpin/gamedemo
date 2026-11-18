@@ -314,7 +314,8 @@ export class Ghost {
   }
 
   getDistance() {
-    const d = this.position.distanceTo(this.player.position);
+    // The ghost reaches the player's body even when their feet are above the floor.
+    const d = Math.hypot(this.position.x - this.player.position.x, this.position.z - this.player.position.z);
     return Number.isFinite(d) ? d : 99;
   }
 

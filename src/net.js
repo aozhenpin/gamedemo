@@ -27,8 +27,8 @@ export class Net {
     if (this.ws && this.ws.readyState === 1) this.ws.send(JSON.stringify(msg));
   }
 
-  hide(x, z, yaw, spotId = -1) {
-    this.send({ t: 'hide', x, z, yaw, spotId });
+  hide(x, z, yaw, spotId = -1, y = 0) {
+    this.send({ t: 'hide', x, y, z, yaw, spotId });
   }
 
   found() {

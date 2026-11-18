@@ -68,7 +68,7 @@ export class AudioSys {
     const ctx = this.ctx;
 
     const droneGain = ctx.createGain();
-    droneGain.gain.value = 0.035;
+    droneGain.gain.value = 0.018;
     const lp = ctx.createBiquadFilter();
     lp.type = 'lowpass';
     lp.frequency.value = 150;
@@ -95,7 +95,7 @@ export class AudioSys {
     nf.frequency.value = 220;
     nf.Q.value = 0.7;
     const ng = ctx.createGain();
-    ng.gain.value = 0.05;
+    ng.gain.value = 0.02;
     noise.connect(nf);
     nf.connect(ng);
     ng.connect(this.master);
@@ -163,13 +163,16 @@ export class AudioSys {
 
   // ---------------------------------------------------------------- 事件音效
 
-  footstep(running) {
+  footstep(running, crouching = false) {
     if (!this.ready) return;
+    const strength = running ? 1 : crouching ? 0.28 : 0.62;
+    const heel = 130 + Math.random() * 30;
+    this.tone({ freq: heel, slideTo: heel * 0.8, attack: 0.004, decay: 0.11, gain: 0.22 * strength });
     this.noiseBurst({
-      freq: 500 + Math.random() * 500,
-      q: 1.6,
-      decay: running ? 0.09 : 0.13,
-      gain: running ? 0.075 : 0.045,
+      freq: 600 + Math.random() * 450,
+      q: 0.85,
+      decay: running ? 0.115 : 0.09,
+      gain: 0.28 * strength,
       rate: 0.8 + Math.random() * 0.5,
     });
   }
@@ -318,7 +321,7 @@ export class AudioSys {
     this.tension += (tension - this.tension) * Math.min(1, dt * 4);
 
     if (this.rumbleGain) {
-      const target = this.tension * this.tension * 0.22;
+      const target = this.tension * this.tension * 0.11;
       this.rumbleGain.gain.setTargetAtTime(target, this.ctx.currentTime, 0.2);
     }
 

@@ -184,10 +184,13 @@ function handle(ws, msg) {
     if (room.phase !== 'HIDE' || player.hidden) return;
     const x = Number(msg.x);
     const z = Number(msg.z);
+    const y = Number(msg.y ?? 0);
     const yaw = Number(msg.yaw);
     if (!Number.isFinite(x) || !Number.isFinite(z)) return;
+    if (!Number.isFinite(y) || y < 0 || y > 3.4) return;
     player.hidden = {
       x,
+      y,
       z,
       yaw: Number.isFinite(yaw) ? yaw : 0,
       spotId: Number.isInteger(msg.spotId) ? msg.spotId : -1,

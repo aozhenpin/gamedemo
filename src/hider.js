@@ -11,7 +11,7 @@ export function createHider(parent, hidden, world) {
   // 优先用躲藏时上报的 spotId，避免“站在柜子旁边也完全隐形”
   if (Number.isInteger(hidden.spotId) && hidden.spotId >= 0 && world.hideSpots[hidden.spotId]) {
     spot = world.hideSpots[hidden.spotId];
-  } else {
+  } else if (hidden.spotId === undefined && !(hidden.y > 0.14)) {
     for (const s of world.hideSpots) {
       if (Math.hypot(s.x - hidden.x, s.z - hidden.z) < 0.85) {
         spot = s;
@@ -65,14 +65,14 @@ export function createHider(parent, hidden, world) {
   );
   hair.position.set(0, 1.765, 0.008);
 
-  group.position.set(hidden.x, 0, hidden.z);
+  group.position.set(hidden.x, hidden.y ?? 0, hidden.z);
   group.rotation.y = (hidden.yaw || 0) + Math.PI;
   parent.add(group);
 
   const insideSpot = !!spot;
   if (insideSpot) group.visible = false;
 
-  const position = new THREE.Vector3(hidden.x, 0, hidden.z);
+  const position = new THREE.Vector3(hidden.x, hidden.y ?? 0, hidden.z);
   let t = Math.random() * 10;
 
   return {
